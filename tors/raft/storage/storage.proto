@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+option go_package="proto/";
+
+message Log {
+	message LogMessage {
+		string key = 1;
+
+		message Value {
+			string data = 1;
+			int32 cnt = 2;
+			bool ok = 3;
+		}
+
+		Value value = 2;
+
+		enum EventType {
+			CREATE = 0;
+			DELETE = 1;
+			UPDATE = 2;
+			PATCH = 3;
+			READ = 4;
+		}
+		EventType queryType = 3;
+	}
+    uint64 term = 1;
+	LogMessage message = 2;
+}
+
+message Storage {
+    uint64 currentTerm = 1;
+	uint32 votedFor = 2;
+	repeated Log logs = 3;
+	uint64 commitLength = 4;
+}
