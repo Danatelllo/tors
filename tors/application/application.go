@@ -1,11 +1,14 @@
 package application
 
 import (
+	"context"
 	"fmt"
-	"github.com/gin-gonic/gin"
+	"log"
 	"net/http"
 	"raft/raft"
 	"raft/raft/storage/proto"
+
+	"github.com/gin-gonic/gin"
 )
 
 type CreateReq struct {
@@ -34,19 +37,30 @@ type DeleteReq struct {
 }
 
 func (s *Server) readValue(c *gin.Context) {
-	if s.Raft.Node.CurrentRole == raft.Leader {
-		c.IndentedJSON(http.StatusFound, gin.H{"Location": s.Raft.Node.GetNextAddress()})
-		return
-	}
 	var req GetReq
 	if err := c.ShouldBindQuery(&req); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
 		return
 	}
 
+	if s.Raft.Node.IsMaster() {
+		c.Header("Location", s.Raft.Node.GetNextAddress()+"/read?key="+req.Key)
+
+		c.IndentedJSON(http.StatusFound, gin.H{"message": "not a master"})
+
+		s.Raft.Node.Logger.Printf("NextAddress %v", s.Raft.Node.GetNextAddress())
+		return
+	}
+
 	s.Raft.ValuesMutex.Lock()
 	defer s.Raft.ValuesMutex.Unlock()
+
+	s.Raft.Node.Logger.Printf("%v Values, %v key, %v log, %v values", s.Raft.Values[req.Key], req.Key, s.Raft.Node.Log, s.Raft.Values)
+
 	val, ok := s.Raft.Values[req.Key]
+
+	s.Raft.Node.Logger.Printf("Val %v", val)
+
 	if ok {
 		c.IndentedJSON(http.StatusOK, val)
 		return
@@ -56,8 +70,8 @@ func (s *Server) readValue(c *gin.Context) {
 }
 
 func (s *Server) createValue(c *gin.Context) {
-	if s.Raft.Node.CurrentRole != raft.Leader {
-		c.IndentedJSON(http.StatusFound, gin.H{"Location": s.Raft.Node.GetNextAddress()})
+	if !s.Raft.Node.IsMaster() {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Is not a master"})
 		return
 	}
 
@@ -69,8 +83,10 @@ func (s *Server) createValue(c *gin.Context) {
 
 	var newLog proto.Log_LogMessage
 	newLog.Value = &proto.Log_LogMessage_Value{}
+
 	newLog.QueryType = proto.Log_LogMessage_CREATE
 	newLog.Key = req.Key
+
 	newLog.Value.Cnt = int32(req.Value.Cnt)
 	newLog.Value.Data = req.Value.Data
 	newLog.Value.Ok = req.Value.Ok
@@ -155,10 +171,19 @@ type Server struct {
 	addr   string
 	Router *gin.Engine
 	Raft   *raft.Server
+	Svr    *http.Server
+}
+
+func (s *Server) Shutdown(c *gin.Context) {
+	s.Svr.Shutdown(context.Background())
+	c.IndentedJSON(http.StatusAccepted, nil)
+}
+
+func (s *Server) RunAgain(c *gin.Context) {
+	go s.Run()
 }
 
 func New(nodeId int, nodeCount int, storagePath string) *Server {
-
 	router := gin.Default()
 
 	var s *Server = &Server{
@@ -167,9 +192,13 @@ func New(nodeId int, nodeCount int, storagePath string) *Server {
 		Raft:   raft.NewServer(nodeId, nodeCount, storagePath),
 	}
 
+	// TODO: need create router in raft and then forward to the application
 	router.POST("/vote_req", s.Raft.HandleVoteReq)
 	router.POST("/log_req", s.Raft.HandleLogReq)
 	router.GET("/is_master", s.Raft.HandleIsMaster)
+
+	router.POST("/shutdown", s.Shutdown)
+	router.POST("/run_again", s.RunAgain)
 
 	router.POST("/create", s.createValue)
 	router.GET("/read", s.readValue)
@@ -177,9 +206,16 @@ func New(nodeId int, nodeCount int, storagePath string) *Server {
 	// router.PATCH("/patch", s.patchValue)
 	// router.DELETE("/delete", s.deleteValue)
 
+	s.Svr = &http.Server{
+		Addr:    s.addr,
+		Handler: s.Router,
+	}
+
 	return s
 }
 
 func (s *Server) Run() {
-	s.Router.Run(s.addr)
+	if err := s.Svr.ListenAndServe(); err != nil {
+		log.Printf("listen: %s\n", err)
+	}
 }

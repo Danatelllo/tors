@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"os/signal"
 	"raft/application"
 	"strconv"
+	"time"
 )
 
 func main() {
@@ -21,5 +24,18 @@ func main() {
 		return
 	}
 	var s *application.Server = application.New(id, nodeCount, args[1])
-	s.Run()
+
+	go s.Run()
+
+	quit := make(chan os.Signal)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+	log.Println("Shutdown Server ...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	if err := s.Svr.Shutdown(ctx); err != nil {
+		log.Fatal("Server Shutdown:", err)
+	}
+	log.Println("Server exiting")
 }

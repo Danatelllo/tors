@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"raft/raft/storage/proto"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +22,6 @@ type Value struct {
 
 type Server struct {
 	Node               *Node
-	NodeMutex          sync.Mutex
 	updateReceivedChan chan bool
 	Values             map[string]Value
 	ValuesMutex        sync.Mutex
@@ -149,9 +149,9 @@ func (s *Server) HandleBackgroundReplicateLog() {
 	for {
 		if s.Node.CurrentRole == Leader {
 			s.Node.Logger.Print("HandleBackgroundReplicateLog")
-			s.NodeMutex.Lock()
+			s.Node.NodeMutex.Lock()
 			s.ReplicateLogs(s.Node.NodeAdresses, false)
-			s.NodeMutex.Unlock()
+			s.Node.NodeMutex.Unlock()
 			time.Sleep(time.Second)
 		}
 	}
@@ -169,17 +169,17 @@ func (s *Server) Acks(length int) int {
 
 func (s *Server) CommitLogEntries() {
 	var minAcks = (s.Node.NodeCount + 2) / 2
+	var ready []int
 
-	var maxReady int
-	for len := len(s.Node.Log) - 1; len > 0; len-- {
-		acks := s.Acks(len)
-		if acks > minAcks {
-			maxReady = acks
-			break
+	var maxReady int = 0
+	for j := 1; j < len(s.Node.Log)+1; j++ {
+		if s.Acks(j) >= minAcks {
+			ready = append(ready, j)
+			maxReady = max(maxReady, j)
 		}
 	}
 
-	if maxReady != 0 && maxReady > s.Node.CommitLength && s.Node.Log[maxReady].Term == s.Node.CurrentTerm {
+	if len(ready) != 0 && maxReady > s.Node.CommitLength && s.Node.Log[maxReady-1].Term == s.Node.CurrentTerm {
 		for j := s.Node.CommitLength; j < maxReady; j++ {
 			switch s.Node.Log[j].Message.QueryType {
 			case proto.Log_LogMessage_CREATE:
@@ -195,6 +195,7 @@ func (s *Server) CommitLogEntries() {
 		}
 		s.Node.CommitLength = maxReady
 	}
+
 	s.Node.Logger.Printf("New log %v", s.Node.Log)
 }
 
@@ -238,8 +239,8 @@ func (s *Server) HandleVoteReq(c *gin.Context) {
 	}
 	s.Node.Logger.Printf("Recieved elect message from %v", req.NodeId)
 
-	s.NodeMutex.Lock()
-	defer s.NodeMutex.Unlock()
+	s.Node.NodeMutex.Lock()
+	defer s.Node.NodeMutex.Unlock()
 	var myLogTerm int = 0
 	if len(s.Node.Log) > 0 {
 		myLogTerm = s.Node.Log[len(s.Node.Log)-1].Term
@@ -262,14 +263,12 @@ func (s *Server) HandleVoteReq(c *gin.Context) {
 		return
 	}
 
-	fmt.Printf("Node %v did not accept new candidate %v", s.Node.NodeId, req.NodeId)
+	fmt.Printf("Node %v did not accept new candidate %v, logOk% v, termOk: %v", s.Node.NodeId, req.NodeId, logOk, termOk)
 	c.IndentedJSON(http.StatusNotAcceptable, VoteRsp{s.Node.NodeId, s.Node.CurrentTerm})
 }
 
 func (s *Server) HandleIsMaster(c *gin.Context) {
-	s.NodeMutex.Lock()
-	defer s.NodeMutex.Unlock()
-	if s.Node.CurrentRole == Leader {
+	if s.Node.IsMaster() {
 		c.IndentedJSON(http.StatusOK, nil)
 		return
 	}
@@ -285,8 +284,8 @@ func (s *Server) HandleLogReq(c *gin.Context) {
 
 	s.Node.Logger.Printf("Log request colled LeaderId: %v", req.LeaderId)
 
-	s.NodeMutex.Lock()
-	defer s.NodeMutex.Unlock()
+	s.Node.NodeMutex.Lock()
+	defer s.Node.NodeMutex.Unlock()
 	if req.CurrentTerm > s.Node.CurrentTerm {
 		s.Node.CurrentTerm = req.CurrentTerm
 		s.Node.CurrentRole = Follower
@@ -322,34 +321,49 @@ func (s *Server) HandleLogReq(c *gin.Context) {
 }
 
 func (s *Server) HandleElections() {
-	// TODO: Think about election timer
+	var ticker *time.Ticker = time.NewTicker(3 * time.Second)
 	for {
-		var ticker *time.Ticker = time.NewTicker(3 * time.Second)
 		select {
 		case <-s.updateReceivedChan:
 			s.Node.Logger.Println("Update received, resetting timer")
+			ticker.Stop()
+			ticker = time.NewTicker(3 * time.Second)
 		case <-ticker.C:
-			s.NodeMutex.Lock()
-			if s.Node.CurrentRole == Leader {
-				s.NodeMutex.Unlock()
+			var currentRole int64 = int64(s.Node.CurrentRole)
+			if atomic.LoadInt64(&currentRole) == int64(Leader) {
 				break
 			}
+
 			s.Node.Logger.Println("No update received for 3 seconds, start elections")
 
 			var wg sync.WaitGroup
 
 			resultChan := make(chan *resty.Response, len(s.Node.NodeAdresses))
 
-			s.Node.CurrentTerm++
-			s.Node.CurrentRole = Candidate
-			s.Node.VotedFor = s.Node.NodeId
+			atomic.AddInt64(&s.Node.CurrentTerm, 1)
+
+			currentRole = int64(s.Node.CurrentRole)
+			atomic.StoreInt64(&s.Node.CurrentRole, Candidate)
+
+			atomic.StoreInt64(&s.Node.VotedFor, s.Node.NodeId)
+
+			s.Node.VotesRecievedMutex.Lock()
 			s.Node.VotesRecieved[s.Node.NodeId] = struct{}{}
+			s.Node.VotesRecievedMutex.Unlock()
+
+			s.Node.SentLengthMutex.Lock()
 			s.Node.SentLength = map[string]int{}
+			s.Node.SentLengthMutex.Unlock()
+
+			s.Node.AckedLengthMutex.Lock()
 			s.Node.AckedLength = map[string]int{}
+			s.Node.AckedLengthMutex.Unlock()
+
 			var lastTerm int = 0
 			if len(s.Node.Log) > 0 {
 				lastTerm = s.Node.Log[len(s.Node.Log)-1].Term
 			}
+			s.Node.NodeMutex.Unlock()
 			s.Node.Logger.Printf("Sending elect messages %v", s.Node.NodeAdresses)
 			for _, nodeAddr := range s.Node.NodeAdresses {
 				s.Node.Logger.Printf("Send elect message for %v", fmt.Sprintf("%v/vote_req", nodeAddr))
@@ -378,6 +392,7 @@ func (s *Server) HandleElections() {
 			wg.Wait()
 			close(resultChan)
 			s.Node.Logger.Println("Finished getting answers from nodes")
+			s.Node.NodeMutex.Lock()
 			for resp := range resultChan {
 				var rsp VoteRsp
 				if err := json.Unmarshal(resp.Body(), &rsp); err != nil {
@@ -398,22 +413,32 @@ func (s *Server) HandleElections() {
 					s.Node.CurrentTerm = rsp.CurrentTerm
 					s.Node.CurrentRole = Follower
 					s.Node.VotedFor = 0
-					s.NodeMutex.Unlock()
+					s.Node.NodeMutex.Unlock()
 					return
 				}
 			}
+			s.Node.NodeMutex.Unlock()
 			s.Node.Logger.Println("Finish elections")
-			s.NodeMutex.Unlock()
 		}
 	}
 }
 
 func (s *Server) HandleNewLogEntry(newLog *proto.Log_LogMessage, c *gin.Context) bool {
-	s.NodeMutex.Lock()
-	defer s.NodeMutex.Unlock()
+	s.Node.NodeMutex.Lock()
+	defer s.Node.NodeMutex.Unlock()
 	s.Node.Log = append(s.Node.Log, Log{s.Node.CurrentTerm, newLog})
+
+	s.Node.Logger.Printf("HandleNewLogEntry %v", newLog)
+
 	s.Node.AckedLength[s.Node.NodeIdToAddress(s.Node.NodeId)] = len(s.Node.Log)
-	return s.ReplicateLogs(s.Node.NodeAdresses, false)
+	var replicateLogRes bool = s.ReplicateLogs(s.Node.NodeAdresses, false)
+	if !replicateLogRes {
+		// there is no commit entries
+		s.Node.Log = s.Node.Log[:len(s.Node.Log)-1]
+		s.Node.AckedLength[s.Node.NodeIdToAddress(s.Node.NodeId)]--
+		return replicateLogRes
+	}
+	return replicateLogRes
 }
 
 func NewServer(nodeId int, nodeCount int, storagePath string) *Server {

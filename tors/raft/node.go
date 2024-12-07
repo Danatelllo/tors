@@ -5,11 +5,12 @@ import (
 	"log"
 	"raft/raft/storage"
 	"raft/raft/storage/proto"
+	"sync"
 )
 
 type Me int
 
-type NodeType int
+type NodeType int64
 
 const (
 	Follower NodeType = iota
@@ -18,32 +19,54 @@ const (
 )
 
 type Log struct {
-	Term    int
+	Term    int64
 	Message *proto.Log_LogMessage
 }
 
 type Node struct {
 	PersistentStoragePath string
-	NodeId                int
+	NodeId                int64
 	NodeCount             int
 	NodeAdresses          []string
 
-	CurrentTerm  int
-	VotedFor     int
-	Log          []Log
+	//////////////////////////////////////
+	CurrentTerm  int64
+	VotedFor     int64
 	CommitLength int
 
 	CurrentRole   NodeType
 	CurrentLeader int
-	VotesRecieved map[int]struct{}
-	SentLength    map[string]int
-	AckedLength   map[string]int
 
-	RoundRobinCounter int
-	Logger            *log.Logger
+	Log      []Log
+	LogMutex sync.Mutex
+
+	VotesRecieved      map[int64]struct{}
+	VotesRecievedMutex sync.Mutex
+
+	SentLength      map[string]int
+	SentLengthMutex sync.Mutex
+
+	AckedLength      map[string]int
+	AckedLengthMutex sync.Mutex
+	//////////////////////////////////////
+
+	RoundRobinCounter      int
+	Logger                 *log.Logger
+	RoundRobinCounterMutex sync.Mutex
+}
+
+func (n *Node) IsMaster() bool {
+	n.NodeMutex.Lock()
+	defer n.NodeMutex.Unlock()
+	if n.CurrentRole == Leader {
+		return true
+	}
+	return false
 }
 
 func (n *Node) GetNextAddress() string {
+	n.RoundRobinCounterMutex.Lock()
+	defer n.RoundRobinCounterMutex.Unlock()
 	address := n.NodeAdresses[n.RoundRobinCounter%len(n.NodeAdresses)]
 	n.RoundRobinCounter++
 	return address
