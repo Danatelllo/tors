@@ -27,13 +27,17 @@ type GetReq struct {
 
 type PatchReq struct {
 	Data *string `json:"data"`
-	Cnt  *int    `json:"cnt"`
+	Cnt  *int32  `json:"cnt"`
 	Ok   *bool   `json:"ok"`
 	Key  string  `json:"key"`
 }
 
 type DeleteReq struct {
 	Key string `json:"key"`
+}
+
+type DropTrafficReq struct {
+	NodeId int `json:"id"`
 }
 
 func (s *Server) readValue(c *gin.Context) {
@@ -44,11 +48,16 @@ func (s *Server) readValue(c *gin.Context) {
 	}
 
 	if s.Raft.Node.IsMaster() {
-		c.Header("Location", s.Raft.Node.GetNextAddress()+"/read?key="+req.Key)
+		addr, err := s.Raft.Node.GetNextAddress()
+		if err != nil {
+			c.IndentedJSON(http.StatusNotFound, gin.H{"error": "not found alive follower"})
+			return
+		}
+		c.Header("Location", addr+"/read?key="+req.Key)
 
 		c.IndentedJSON(http.StatusFound, gin.H{"message": "not a master"})
 
-		s.Raft.Node.Logger.Printf("NextAddress %v", s.Raft.Node.GetNextAddress())
+		s.Raft.Node.Logger.Printf("NextAddress %v", addr)
 		return
 	}
 
@@ -81,6 +90,14 @@ func (s *Server) createValue(c *gin.Context) {
 		return
 	}
 
+	s.Raft.ValuesMutex.Lock()
+	_, ok := s.Raft.Values[req.Key]
+	if ok {
+		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "can not create exists object"})
+		s.Raft.ValuesMutex.Unlock()
+	}
+	s.Raft.ValuesMutex.Unlock()
+
 	var newLog proto.Log_LogMessage
 	newLog.Value = &proto.Log_LogMessage_Value{}
 
@@ -100,72 +117,119 @@ func (s *Server) createValue(c *gin.Context) {
 	c.JSON(http.StatusOK, req.Value)
 }
 
-// func (s *Server) updateValue(c *gin.Context) {
-// 	var req UpdateReq
-// 	if err := c.BindJSON(&req); err != nil {
-// 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
-// 		return
-// 	}
+func (s *Server) updateValue(c *gin.Context) {
+	var req UpdateReq
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
+		return
+	}
 
-// 	_, ok := s.Values[req.Key]
-// 	if ok {
-// 		var newLog proto.Log
-// 		newLog.QueryType = proto.Log.LogMessage.QueryType.CREATE
-// 		newLog.Key = req.Key
-// 		newLog.Value = req.Value
+	s.Raft.ValuesMutex.Lock()
+	_, ok := s.Raft.Values[req.Key]
+	if !ok {
+		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "value not found"})
+		s.Raft.ValuesMutex.Unlock()
+	}
+	s.Raft.ValuesMutex.Unlock()
 
-// 		s.Raft.HandleNewLogEntry(newLog, c)
-// 		return
-// 	}
+	var newLog proto.Log_LogMessage
+	newLog.Value = &proto.Log_LogMessage_Value{}
 
-// 	c.IndentedJSON(http.StatusNotFound, gin.H{"message": "value not found"})
-// }
+	newLog.QueryType = proto.Log_LogMessage_UPDATE
+	newLog.Key = req.Key
 
-// func (s *Server) patchValue(c *gin.Context) {
-// 	var req PatchReq
-// 	if err := c.BindJSON(&req); err != nil {
-// 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
-// 		return
-// 	}
+	newLog.Value.Cnt = int32(req.Value.Cnt)
+	newLog.Value.Data = req.Value.Data
+	newLog.Value.Ok = req.Value.Ok
 
-// 	value, ok := s.Values[req.Key]
-// 	if ok {
-// 		if req.Data != nil {
-// 			value.Data = *req.Data
-// 		}
+	s.Raft.Node.Logger.Printf("UPDATE CALL %v, %v", newLog, req)
+	var commitHappened bool = s.Raft.HandleNewLogEntry(&newLog, c)
+	if !commitHappened {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update value, unable to commit message to log"})
+		return
+	}
 
-// 		if req.Cnt != nil {
-// 			value.Cnt = *req.Cnt
-// 		}
+	c.JSON(http.StatusOK, req.Value)
+}
 
-// 		if req.Ok != nil {
-// 			value.Ok = *req.Ok
-// 		}
+func (s *Server) patchValue(c *gin.Context) {
+	var req PatchReq
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
+		return
+	}
 
-// 		s.Raft.Values[req.Key] = value
-// 		c.IndentedJSON(http.StatusOK, value)
-// 		return
-// 	}
+	var newLog proto.Log_LogMessage
+	newLog.Value = &proto.Log_LogMessage_Value{}
 
-// 	c.IndentedJSON(http.StatusNotFound, gin.H{"message": "value not found"})
-// }
+	newLog.QueryType = proto.Log_LogMessage_PATCH
+	newLog.Key = req.Key
 
-// func (s *Server) deleteValue(c *gin.Context) {
-// 	var req DeleteReq
-// 	if err := c.BindJSON(&req); err != nil {
-// 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
-// 		return
-// 	}
+	s.Raft.ValuesMutex.Lock()
+	value, ok := s.Raft.Values[req.Key]
+	if !ok {
+		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "value not found"})
+		s.Raft.ValuesMutex.Unlock()
+	}
+	s.Raft.ValuesMutex.Unlock()
 
-// 	value, ok := s.Values[req.Key]
-// 	if ok {
-// 		delete(s.Values, req.Key)
-// 		c.IndentedJSON(http.StatusOK, value)
-// 		return
-// 	}
+	newLog.Value.Cnt = int32(value.Cnt)
+	newLog.Value.Data = value.Data
+	newLog.Value.Ok = value.Ok
+	if ok {
+		if req.Data != nil {
+			newLog.Value.Data = *req.Data
+		}
 
-// 	c.IndentedJSON(http.StatusNotFound, gin.H{"message": "value not found"})
-// }
+		if req.Cnt != nil {
+			newLog.Value.Cnt = *req.Cnt
+		}
+
+		if req.Ok != nil {
+			newLog.Value.Ok = *req.Ok
+		}
+	}
+
+	var commitHappened bool = s.Raft.HandleNewLogEntry(&newLog, c)
+	if !commitHappened {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update value, unable to commit message to log"})
+		return
+	}
+
+	c.JSON(http.StatusOK, newLog.Value)
+}
+
+func (s *Server) deleteValue(c *gin.Context) {
+	var req DeleteReq
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
+		return
+	}
+
+	s.Raft.ValuesMutex.Lock()
+	value, ok := s.Raft.Values[req.Key]
+	if !ok {
+		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "value not found"})
+		s.Raft.ValuesMutex.Unlock()
+		return
+	}
+	s.Raft.ValuesMutex.Unlock()
+
+	var newLog proto.Log_LogMessage
+	newLog.Value = &proto.Log_LogMessage_Value{}
+
+	newLog.QueryType = proto.Log_LogMessage_DELETE
+	newLog.Key = req.Key
+
+	var commitHappened bool = s.Raft.HandleNewLogEntry(&newLog, c)
+
+	if !commitHappened {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update value, unable to commit message to log"})
+		return
+	}
+
+	c.JSON(http.StatusOK, value)
+}
 
 type Server struct {
 	addr   string
@@ -183,6 +247,22 @@ func (s *Server) RunAgain(c *gin.Context) {
 	go s.Run()
 }
 
+func (s *Server) DropTraffic(c *gin.Context) {
+	var req DropTrafficReq
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("can not parse body: %v", err)})
+		return
+	}
+
+	s.Raft.Node.AddToDropTraffic(req.NodeId)
+	c.IndentedJSON(http.StatusOK, nil)
+}
+
+func (s *Server) UndropTraffic(c *gin.Context) {
+	s.Raft.Node.UndropTraffic()
+	c.IndentedJSON(http.StatusOK, nil)
+}
+
 func New(nodeId int, nodeCount int, storagePath string) *Server {
 	router := gin.Default()
 
@@ -197,14 +277,14 @@ func New(nodeId int, nodeCount int, storagePath string) *Server {
 	router.POST("/log_req", s.Raft.HandleLogReq)
 	router.GET("/is_master", s.Raft.HandleIsMaster)
 
-	router.POST("/shutdown", s.Shutdown)
-	router.POST("/run_again", s.RunAgain)
+	router.POST("/drop_traffic", s.DropTraffic)
+	router.POST("/unblock_drop_traffic", s.UndropTraffic)
 
 	router.POST("/create", s.createValue)
 	router.GET("/read", s.readValue)
-	// router.PUT("/update", s.updateValue)
-	// router.PATCH("/patch", s.patchValue)
-	// router.DELETE("/delete", s.deleteValue)
+	router.PUT("/update", s.updateValue)
+	router.PATCH("/patch", s.patchValue)
+	router.DELETE("/delete", s.deleteValue)
 
 	s.Svr = &http.Server{
 		Addr:    s.addr,

@@ -1,11 +1,13 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"raft/raft/storage"
 	"raft/raft/storage/proto"
 	"sync"
+	"sync/atomic"
 )
 
 type Me int
@@ -27,15 +29,16 @@ type Node struct {
 	PersistentStoragePath string
 	NodeId                int64
 	NodeCount             int
-	NodeAdresses          []string
+	NodeAddresses         []string
 
 	//////////////////////////////////////
+
 	CurrentTerm  int64
 	VotedFor     int64
-	CommitLength int
+	CommitLength int64
 
-	CurrentRole   NodeType
-	CurrentLeader int
+	CurrentRole   int64
+	CurrentLeader int64
 
 	Log      []Log
 	LogMutex sync.Mutex
@@ -43,33 +46,76 @@ type Node struct {
 	VotesRecieved      map[int64]struct{}
 	VotesRecievedMutex sync.Mutex
 
-	SentLength      map[string]int
+	SentLength      map[string]int64
 	SentLengthMutex sync.Mutex
 
-	AckedLength      map[string]int
+	AckedLength      map[string]int64
 	AckedLengthMutex sync.Mutex
+
 	//////////////////////////////////////
 
 	RoundRobinCounter      int
 	Logger                 *log.Logger
 	RoundRobinCounterMutex sync.Mutex
+
+	NodesLiveness      map[string]bool
+	NodesLivenessMutex sync.Mutex
+
+	NodesDropTraffic      map[int]struct{}
+	NodesDropTrafficMutex sync.Mutex
+}
+
+func (n *Node) NeedDropTraffic(id int) bool {
+	n.NodesDropTrafficMutex.Lock()
+	defer n.NodesDropTrafficMutex.Unlock()
+
+	_, ok := n.NodesDropTraffic[id]
+	return ok
+}
+
+func (n *Node) AddToDropTraffic(id int) {
+	n.NodesDropTrafficMutex.Lock()
+	defer n.NodesDropTrafficMutex.Unlock()
+
+	n.NodesDropTraffic[id] = struct{}{}
+}
+
+func (n *Node) UndropTraffic() {
+	n.NodesDropTrafficMutex.Lock()
+	defer n.NodesDropTrafficMutex.Unlock()
+
+	n.NodesDropTraffic = map[int]struct{}{}
 }
 
 func (n *Node) IsMaster() bool {
-	n.NodeMutex.Lock()
-	defer n.NodeMutex.Unlock()
-	if n.CurrentRole == Leader {
+	if atomic.LoadInt64(&n.CurrentRole) == int64(Leader) {
 		return true
 	}
 	return false
 }
 
-func (n *Node) GetNextAddress() string {
+func (n *Node) GetNextAddress() (string, error) {
 	n.RoundRobinCounterMutex.Lock()
 	defer n.RoundRobinCounterMutex.Unlock()
-	address := n.NodeAdresses[n.RoundRobinCounter%len(n.NodeAdresses)]
-	n.RoundRobinCounter++
-	return address
+
+	n.Logger.Printf("alive nodes %v", n.NodesLiveness)
+
+	initialCounter := n.RoundRobinCounter
+
+	for {
+		address := n.NodeAddresses[n.RoundRobinCounter%len(n.NodeAddresses)]
+		n.RoundRobinCounter++
+
+		if n.NodesLiveness[address] {
+			return address, nil
+		}
+
+		if n.RoundRobinCounter%len(n.NodeAddresses) == initialCounter {
+			break
+		}
+	}
+
+	return "", errors.New("all nodes are dead")
 }
 
 func (n *Node) FillFieldsFromPersistentState() error {
@@ -78,35 +124,37 @@ func (n *Node) FillFieldsFromPersistentState() error {
 		return err
 	}
 
-	n.CurrentTerm = int(storage.CurrentTerm)
-	n.VotedFor = int(storage.VotedFor)
+	n.CurrentTerm = int64(storage.CurrentTerm)
+	n.VotedFor = int64(storage.VotedFor)
 
 	for _, logEntry := range storage.Logs {
 		n.Log = append(n.Log, Log{
-			Term:    int(logEntry.Term),
+			Term:    int64(logEntry.Term),
 			Message: logEntry.Message,
 		})
 	}
 
-	n.CommitLength = int(storage.CommitLength)
+	n.CommitLength = int64(storage.CommitLength)
 
 	return nil
 }
 
-func (n *Node) NodeIdToAddress(id int) string {
+func (n *Node) NodeIdToAddress(id int64) string {
 	return fmt.Sprintf("http://127.0.0.%v:8080", id)
 }
 
-func NewNode(nodeId int, nodeCount int, persistentStoragePath string) *Node {
+func NewNode(nodeId int64, nodeCount int, persistentStoragePath string) *Node {
 	node := &Node{
 		PersistentStoragePath: persistentStoragePath,
 		NodeId:                nodeId,
 		NodeCount:             nodeCount,
-		CurrentRole:           Follower,
+		CurrentRole:           int64(Follower),
 		CurrentLeader:         0,
-		VotesRecieved:         make(map[int]struct{}),
-		SentLength:            map[string]int{},
-		AckedLength:           map[string]int{},
+		VotesRecieved:         make(map[int64]struct{}),
+		SentLength:            map[string]int64{},
+		AckedLength:           map[string]int64{},
+		NodesLiveness:         map[string]bool{},
+		NodesDropTraffic:      map[int]struct{}{},
 
 		Logger: log.Default(),
 	}
@@ -114,9 +162,10 @@ func NewNode(nodeId int, nodeCount int, persistentStoragePath string) *Node {
 	node.Logger.SetPrefix(fmt.Sprintf("NodeId %v   ", nodeId))
 	node.FillFieldsFromPersistentState()
 
-	for j := 1; j < node.NodeCount+1; j++ {
+	for j := int64(2); j < int64(node.NodeCount+2); j++ {
 		if j != node.NodeId {
-			node.NodeAdresses = append(node.NodeAdresses, node.NodeIdToAddress(j))
+			node.NodeAddresses = append(node.NodeAddresses, node.NodeIdToAddress(j))
+			node.NodesLiveness[node.NodeIdToAddress(j)] = true
 		}
 	}
 
