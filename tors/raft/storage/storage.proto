@@ -28,8 +28,8 @@ message Log {
 }
 
 message Storage {
-    uint64 currentTerm = 1;
-	uint32 votedFor = 2;
+    int64 currentTerm = 1;
+	int32 votedFor = 2;
 	repeated Log logs = 3;
-	uint64 commitLength = 4;
+	int64 commitLength = 4;
 }

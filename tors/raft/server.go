@@ -139,7 +139,6 @@ func (s *Server) ReplicateLogsImpl(addresses []string, commitHappened *bool, cal
 				s.Node.AckedLength[addr] = rsp.Ack
 				s.Node.AckedLengthMutex.Unlock()
 				s.CommitLogEntries()
-				*commitHappened = true
 			} else if s.Node.SentLength[addr] > 0 {
 				s.Node.SentLength[addr] = s.Node.SentLength[addr] - 1
 				addressesForReplicateLogs = append(addressesForReplicateLogs, addr)
@@ -155,6 +154,9 @@ func (s *Server) ReplicateLogsImpl(addresses []string, commitHappened *bool, cal
 	if len(addressesForReplicateLogs) > 0 {
 		s.ReplicateLogsImpl(addressesForReplicateLogs, commitHappened, calledInElections)
 	}
+
+	s.Node.Logger.Printf("%v, %v", s.Node.Log, atomic.LoadInt64(&s.Node.CommitLength))
+	*commitHappened = (int64(len(s.Node.Log)) == atomic.LoadInt64(&s.Node.CommitLength))
 }
 
 func (s *Server) ReplicateLogs(addresses []string, calledInElections bool) bool {
@@ -167,7 +169,10 @@ func (s *Server) HandleBackgroundReplicateLog() {
 	for {
 		if atomic.LoadInt64(&s.Node.CurrentRole) == int64(Leader) {
 			s.Node.Logger.Print("HandleBackgroundReplicateLog")
+			s.Node.LogMutex.Lock()
 			s.ReplicateLogs(s.Node.NodeAddresses, false)
+			s.Node.LogMutex.Unlock()
+			s.Node.WriteState()
 			time.Sleep(time.Second)
 		}
 	}
@@ -189,6 +194,7 @@ func (s *Server) CommitLogEntries() {
 
 	var maxReady int64 = 0
 	s.Node.AckedLengthMutex.Lock()
+	s.Node.Logger.Printf("AckedLength %v", s.Node.AckedLength)
 	for j := int64(1); j < int64(len(s.Node.Log)+1); j++ {
 		if s.Acks(j) >= minAcks {
 			ready = append(ready, j)
@@ -343,13 +349,15 @@ func (s *Server) HandleVoteReq(c *gin.Context) {
 	// log term of new candidate more or not less than follower
 	var logOk bool = (req.CurrentLogTerm > myLogTerm) || (req.CurrentLogTerm == myLogTerm && req.CurrentLogLength >= nodeLength)
 
-	// term of new candidate more or this follower already hasf voted for him
+	// term of new candidate more or this follower already has voted for him
 	var termOk bool = (req.CurrentTerm > atomic.LoadInt64(&s.Node.CurrentTerm)) || (req.CurrentTerm == atomic.LoadInt64(&s.Node.CurrentTerm) && req.NodeId == atomic.LoadInt64(&s.Node.VotedFor))
 
 	if logOk && termOk {
 		atomic.StoreInt64(&s.Node.CurrentTerm, req.CurrentTerm)
 		atomic.StoreInt64(&s.Node.CurrentRole, int64(Follower))
 		s.Node.VotedFor = req.NodeId
+
+		s.Node.WriteState()
 
 		fmt.Printf("Node %v accepted new candidate %v", s.Node.NodeId, req.NodeId)
 
@@ -422,17 +430,16 @@ func (s *Server) HandleLogReq(c *gin.Context) {
 	s.updateReceivedChan <- true
 
 	s.ValuesMutex.Lock()
-	s.Node.Logger.Printf("Valeus %v", s.Values)
+	s.Node.Logger.Printf("Values %v", s.Values)
+	s.Node.Logger.Printf("Log %v", s.Node.Log)
 	s.ValuesMutex.Unlock()
 }
 
 func (s *Server) HandleElections() {
 	rand.Seed(uint64(s.Node.NodeId))
 
-	// Генерация случайного смещения от 0 до 3 секунд
 	randomOffset := time.Duration(rand.Int63n(3 * int64(time.Second)))
 
-	// Ждем смещение перед началом выборов
 	time.Sleep(randomOffset)
 
 	var ticker *time.Ticker = time.NewTicker(3 * time.Second)
@@ -470,7 +477,7 @@ func (s *Server) HandleElections() {
 			s.Node.AckedLengthMutex.Unlock()
 
 			s.Node.NodesLivenessMutex.Lock()
-			for j := int64(1); j < int64(s.Node.NodeCount+1); j++ {
+			for j := int64(2); j < int64(s.Node.NodeCount+1); j++ {
 				if j != s.Node.NodeId {
 					s.Node.NodesLiveness[s.Node.NodeIdToAddress(j)] = true
 				}
@@ -531,7 +538,10 @@ func (s *Server) HandleElections() {
 						atomic.StoreInt64(&s.Node.CurrentRole, int64(Leader))
 						atomic.StoreInt64(&s.Node.CurrentLeader, s.Node.NodeId)
 
+						s.Node.LogMutex.Lock()
 						s.ReplicateLogs(s.Node.NodeAddresses, true)
+						s.Node.LogMutex.Unlock()
+						s.Node.WriteState()
 					}
 				} else if rsp.CurrentTerm > s.Node.CurrentTerm {
 					s.Node.Logger.Println("Found another leader, abort elections")
@@ -550,13 +560,20 @@ func (s *Server) HandleElections() {
 
 func (s *Server) HandleNewLogEntry(newLog *proto.Log_LogMessage, c *gin.Context) bool {
 	s.Node.LogMutex.Lock()
-	defer s.Node.LogMutex.Unlock()
+
 	s.Node.Log = append(s.Node.Log, Log{s.Node.CurrentTerm, newLog})
 
-	s.Node.Logger.Printf("HandleNewLogEntry %v", newLog)
-
+	s.Node.AckedLengthMutex.Lock()
 	s.Node.AckedLength[s.Node.NodeIdToAddress(s.Node.NodeId)] = int64(len(s.Node.Log))
+	s.Node.AckedLengthMutex.Unlock()
+
+	s.Node.Logger.Printf("HandleNewLogEntry %v", newLog)
 	var replicateLogRes bool = s.ReplicateLogs(s.Node.NodeAddresses, false)
+	if replicateLogRes {
+		s.ReplicateLogs(s.Node.NodeAddresses, false)
+	}
+	s.Node.LogMutex.Unlock()
+	s.Node.WriteState()
 
 	return replicateLogRes
 }

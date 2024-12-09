@@ -94,6 +94,26 @@ func (n *Node) IsMaster() bool {
 	return false
 }
 
+func (n *Node) WriteState() error {
+	var storageData proto.Storage
+
+	storageData.CommitLength = atomic.LoadInt64(&n.CommitLength)
+	storageData.CurrentTerm = atomic.LoadInt64(&n.CurrentLeader)
+	storageData.CommitLength = atomic.LoadInt64(&n.CommitLength)
+
+	n.LogMutex.Lock()
+	defer n.LogMutex.Unlock()
+	for _, log := range n.Log {
+		var protoLog proto.Log
+		protoLog.Message = log.Message
+		protoLog.Term = uint64(log.Term)
+
+		storageData.Logs = append(storageData.Logs, &protoLog)
+	}
+
+	return storage.WriteProtoToFile(n.PersistentStoragePath, &storageData)
+}
+
 func (n *Node) GetNextAddress() (string, error) {
 	n.RoundRobinCounterMutex.Lock()
 	defer n.RoundRobinCounterMutex.Unlock()

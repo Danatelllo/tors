@@ -27,7 +27,7 @@ const (
 )
 
 func createRaftNode(t *testing.T, nodeID int, numNodes int) *exec.Cmd {
-	cmd := exec.Command("go", "run", "main.go", "~/tors/tmp/1", strconv.Itoa(nodeID), strconv.Itoa(numNodes))
+	cmd := exec.Command("go", "run", "main.go", fmt.Sprintf("/home/chebryakov/tors_new/tmp/%v", nodeID), strconv.Itoa(nodeID), strconv.Itoa(numNodes))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -49,7 +49,6 @@ func createRaftNode(t *testing.T, nodeID int, numNodes int) *exec.Cmd {
 }
 
 func CreateRaftNodes(t *testing.T) []*exec.Cmd {
-
 	var nodes []*exec.Cmd
 	for i := 2; i < numNodes+2; i++ {
 		nodes = append(nodes, createRaftNode(t, i, numNodes))
@@ -60,6 +59,11 @@ func CreateRaftNodes(t *testing.T) []*exec.Cmd {
 func KillRaftNodes(t *testing.T, nodes []*exec.Cmd) error {
 	for _, node := range nodes {
 		SendSignal(t, node, syscall.SIGINT)
+	}
+	for j, _ := range nodes {
+		if err := os.Remove(fmt.Sprintf("/home/chebryakov/tors_new/tmp/%v", j+2)); err != nil {
+			fmt.Printf("Error: %v", err)
+		}
 	}
 	return nil
 }
@@ -317,8 +321,6 @@ func TestRaftNodes(t *testing.T) {
 	var getReq application.GetReq
 	getReq.Key = "1"
 
-	time.Sleep(1 * time.Second)
-
 	// do call to master with Found and Location
 	err, statusCode, value = GetCall(t, addresses[masterId], getReq)
 
@@ -337,8 +339,6 @@ func TestRaftNodes(t *testing.T) {
 
 	StopRaftNode(t, nodes[masterId])
 
-	fmt.Printf("asldfkjlkdf")
-
 	newMasterId := WaitLeader(t, addresses)
 
 	require.NotEqual(t, newMasterId, masterId)
@@ -354,9 +354,7 @@ func TestRaftNodes(t *testing.T) {
 	require.Equal(t, http.StatusOK, statusCode)
 	require.Equal(t, value, raft.Value{Cnt: 10, Data: "data"})
 
-	time.Sleep(1 * time.Second)
-
-	// do call for another
+	// do call for another here i go to the same node
 	getReq.Key = "2"
 	err, statusCode, value = GetCall(t, addresses[newMasterId], getReq)
 
@@ -382,12 +380,14 @@ func TestRaftNodes(t *testing.T) {
 
 }
 
-func TestRaftDrop(t *testing.T) {
+func TestRaftDropPartial(t *testing.T) {
 	var nodes []*exec.Cmd = CreateRaftNodes(t)
 	var addresses []string = getRaftNodesAddresses(t)
 	require.Equal(t, len(addresses), 3)
 	time.Sleep(7 * time.Second)
 	defer KillRaftNodes(t, nodes)
+
+	//reject leader with bad log
 
 	masterId := WaitLeader(t, addresses)
 	var newMasterId int = (masterId + 1) % 3
@@ -488,13 +488,13 @@ func TestRaftDropMaster(t *testing.T) {
 	require.Equal(t, http.StatusOK, statusCode)
 	require.Equal(t, value, raft.Value{Cnt: 10, Data: "data"})
 
-	time.Sleep(10 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	for _, addr := range addresses {
 		UnblockTraffic(t, addr)
 	}
 
-	time.Sleep(10 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	var getReq application.GetReq
 	getReq.Key = "1"
