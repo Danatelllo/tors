@@ -96,6 +96,7 @@ func (s *Server) createValue(c *gin.Context) {
 		c.IndentedJSON(http.StatusNotFound, gin.H{"message": "can not create exists object"})
 		s.Raft.ValuesMutex.Unlock()
 	}
+
 	s.Raft.ValuesMutex.Unlock()
 
 	var newLog proto.Log_LogMessage

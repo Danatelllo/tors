@@ -10,8 +10,6 @@ import (
 	"sync/atomic"
 )
 
-type Me int
-
 type NodeType int64
 
 const (

@@ -569,9 +569,11 @@ func (s *Server) HandleNewLogEntry(newLog *proto.Log_LogMessage, c *gin.Context)
 
 	s.Node.Logger.Printf("HandleNewLogEntry %v", newLog)
 	var replicateLogRes bool = s.ReplicateLogs(s.Node.NodeAddresses, false)
-	if replicateLogRes {
-		s.ReplicateLogs(s.Node.NodeAddresses, false)
+	if !replicateLogRes {
+		s.Node.AckedLength[s.Node.NodeIdToAddress(s.Node.NodeId)] = int64(len(s.Node.Log)) - 1
+		s.Node.Log = s.Node.Log[:len(s.Node.Log)-1]
 	}
+	s.ReplicateLogs(s.Node.NodeAddresses, false)
 	s.Node.LogMutex.Unlock()
 	s.Node.WriteState()
 
